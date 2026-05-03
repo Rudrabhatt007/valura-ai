@@ -3,34 +3,43 @@
 Single endpoint ``POST /api/v1/query`` that runs the full pipeline:
 
 1. Safety guard → block if harmful
-2. Session history retrieval
-3. Intent classification (LLM call)
+2. Session history retrieval (degrades gracefully)
+3. Intent classification (LLM call with timeout + fallback)
 4. Agent routing
 5. Streamed response via Server-Sent Events
 
-All responses flow through SSE — there is no JSON fallback path.
-Errors are returned as structured ``event: error`` SSE frames.
+**Architectural decision**: SSE is the ONLY response mode.  There is
+no JSON fallback path.  Errors, safety blocks, and pipeline state are
+all communicated through SSE events — never via HTTP 4xx/5xx status
+codes for pipeline failures.  The reason: once a streaming response
+starts, the HTTP status code cannot change.  Only malformed requests
+(caught by FastAPI validation) return HTTP 422.
 """
 
 from __future__ import annotations
 
 import asyncio
-import json
+import logging
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator
 
 import structlog
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
-from sse_starlette.sse import EventSourceResponse
+from fastapi.responses import StreamingResponse
 
 from src.classifier.classifier import classify
-from src.classifier.schema import ClassifierOutput
+from src.classifier.schema import ClassifierOutput, FALLBACK_CLASSIFIER_OUTPUT
 from src.config import get_settings
 from src.memory.session import SessionStore
-from src.models.api import PipelineMetadata, QueryRequest
+from src.models.api import QueryRequest
 from src.router.router import get_agent
 from src.safety.guard import check as safety_check
+from src.utils.sse import (
+    format_safety_block,
+    format_sse_done,
+    format_sse_error,
+    format_sse_metadata,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -38,8 +47,6 @@ logger = structlog.get_logger(__name__)
 # ---------------------------------------------------------------------------
 # Structured logging setup
 # ---------------------------------------------------------------------------
-
-import logging
 
 def _configure_logging(log_level: str) -> None:
     """Configure structlog for structured JSON logging."""
@@ -84,15 +91,16 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     app.state.session_store = session_store
 
     await logger.ainfo(
-        "app_startup",
+        "valura_ai_startup",
         environment=settings.environment,
         classifier_model=settings.classifier_model,
         pipeline_timeout=settings.pipeline_timeout_seconds,
+        db_path=db_path,
     )
 
     yield  # Application runs here.
 
-    await logger.ainfo("app_shutdown")
+    await logger.ainfo("valura_ai_shutdown")
 
 
 # ---------------------------------------------------------------------------
@@ -108,142 +116,192 @@ app = FastAPI(
 
 
 # ---------------------------------------------------------------------------
-# SSE helpers
-# ---------------------------------------------------------------------------
-
-def _sse_event(event: str, data: dict | str) -> dict:
-    """Build an SSE event dict for EventSourceResponse."""
-    payload = json.dumps(data) if isinstance(data, dict) else data
-    return {"event": event, "data": payload}
-
-
-# ---------------------------------------------------------------------------
 # Pipeline endpoint
 # ---------------------------------------------------------------------------
 
 @app.post("/api/v1/query")
-async def query_endpoint(request_body: QueryRequest, request: Request) -> EventSourceResponse:
+async def query_pipeline(
+    request_body: QueryRequest,
+    req: Request,
+) -> StreamingResponse:
     """Run the full AI pipeline and stream the response via SSE.
 
     Pipeline order:
     1. Safety guard check
-    2. Session history retrieval
-    3. Intent classification
-    4. Agent routing + streaming
-    5. Save turns to session
+    2. Session history retrieval (degrades gracefully)
+    3. Intent classification (timeout + fallback)
+    4. Stream pipeline metadata (first SSE event)
+    5. Route to agent + stream response
+    6. Save session turn (fire and forget)
+    7. Done event
 
-    All errors are returned as structured SSE error events.
+    All pipeline errors are returned as structured SSE events.
+    Only malformed requests return HTTP 4xx (via FastAPI validation).
     """
     settings = get_settings()
-    session_store: SessionStore = request.app.state.session_store
+    session_store: SessionStore = req.app.state.session_store
 
-    async def event_generator() -> AsyncGenerator[dict, None]:
-        """Generate SSE events for the pipeline."""
+    async def generate() -> AsyncGenerator[str, None]:
+        """Inner async generator — produces raw SSE strings."""
+
+        # ── Step 1: Safety guard ──────────────────────────────────
         try:
-            # ── Step 1: Safety guard ──────────────────────────────
             safety_result = safety_check(request_body.query)
+        except Exception as exc:
+            logger.error("safety_guard_error", error=str(exc))
+            yield format_sse_error("Safety check failed", "SAFETY_ERROR")
+            yield format_sse_done()
+            return
 
-            if not safety_result.passed:
-                await logger.awarning(
-                    "query_blocked",
-                    category=safety_result.category,
-                    query=request_body.query[:100],
-                )
-                yield _sse_event("error", {
-                    "error": "query_blocked",
-                    "category": safety_result.category,
-                    "message": safety_result.refusal_message,
-                })
-                return
+        if not safety_result.passed:
+            logger.info(
+                "query_blocked",
+                category=safety_result.category,
+                query=request_body.query[:100],
+            )
+            yield format_safety_block(
+                safety_result.category or "unknown",
+                safety_result.refusal_message or "Request blocked by safety guard.",
+            )
+            yield format_sse_done()
+            return
 
-            # ── Step 2: Session history ───────────────────────────
-            session_history = await session_store.get_recent_turns(
+        # ── Step 2: Load session history (degrade gracefully) ─────
+        try:
+            history = await session_store.get_recent_turns(
                 request_body.session_id,
                 limit=settings.max_session_history_turns,
             )
+        except Exception as exc:
+            logger.error(
+                "session_load_error",
+                error=str(exc),
+                session_id=request_body.session_id,
+            )
+            history = []  # History is not critical — continue without it
 
-            # ── Step 3: Intent classification ─────────────────────
+        # ── Step 3: Intent classification ─────────────────────────
+        try:
             classifier_output: ClassifierOutput = await asyncio.wait_for(
                 classify(
                     query=request_body.query,
-                    session_history=session_history,
+                    session_history=history,
                     user_profile=request_body.user_profile,
                 ),
-                timeout=settings.pipeline_timeout_seconds,
+                timeout=10.0,  # Classifier gets 10s of the total budget
             )
-
-            # ── Step 4: Route to agent ────────────────────────────
-            agent = get_agent(classifier_output.target_agent)
-
-            # ── Step 5a: Stream metadata ──────────────────────────
-            metadata = PipelineMetadata(
+        except asyncio.TimeoutError:
+            logger.warning(
+                "classifier_timeout",
                 session_id=request_body.session_id,
-                classified_intent=classifier_output.intent,
-                target_agent=classifier_output.target_agent.value,
-                entities=classifier_output.entities.model_dump(exclude_none=True),
-                safety_verdict=classifier_output.safety_verdict,
             )
-            yield _sse_event("metadata", metadata.model_dump())
+            classifier_output = FALLBACK_CLASSIFIER_OUTPUT
+        except Exception as exc:
+            logger.error(
+                "classifier_error",
+                error=str(exc),
+                session_id=request_body.session_id,
+            )
+            classifier_output = FALLBACK_CLASSIFIER_OUTPUT
 
-            # ── Step 5b: Stream agent response ────────────────────
-            agent_response_chunks: list[str] = []
+        # ── Step 4: Stream pipeline metadata (FIRST SSE event) ────
+        metadata = {
+            "session_id": request_body.session_id,
+            "classified_intent": classifier_output.intent,
+            "target_agent": classifier_output.target_agent.value,
+            "entities": classifier_output.entities.model_dump(exclude_none=True),
+            "safety_verdict": classifier_output.safety_verdict,
+            "confidence": classifier_output.confidence,
+        }
+        yield format_sse_metadata(metadata)
 
+        # ── Step 5: Route to agent and stream response ────────────
+        try:
+            agent = get_agent(classifier_output.target_agent)
+        except Exception as exc:
+            logger.error("routing_error", error=str(exc))
+            yield format_sse_error("Routing failed", "ROUTING_ERROR")
+            yield format_sse_done()
+            return
+
+        try:
             async for chunk in agent.run(
                 query=request_body.query,
                 entities=classifier_output.entities,
                 user_profile=request_body.user_profile,
-                session_history=session_history,
+                session_history=history,
+                classified_intent=classifier_output.intent,
+                target_agent=classifier_output.target_agent.value,
             ):
-                agent_response_chunks.append(chunk)
-                yield _sse_event("chunk", chunk)
-
-            # ── Step 5c: Signal completion ────────────────────────
-            yield _sse_event("done", "")
-
-            # ── Step 6: Save turns (fire and forget) ──────────────
-            full_response = "".join(agent_response_chunks)
-            asyncio.create_task(
-                _save_turns(
-                    session_store,
-                    request_body.session_id,
-                    request_body.query,
-                    full_response,
-                )
+                yield chunk
+        except asyncio.CancelledError:
+            logger.info(
+                "client_disconnected",
+                session_id=request_body.session_id,
+            )
+            return
+        except Exception as exc:
+            logger.error(
+                "agent_error",
+                error=str(exc),
+                agent=classifier_output.target_agent.value,
+            )
+            yield format_sse_error(
+                f"Agent execution failed: {type(exc).__name__}",
+                "AGENT_ERROR",
             )
 
+        # ── Step 6: Save session turn (fire and forget) ───────────
+        asyncio.create_task(
+            _save_session_turn(
+                session_store,
+                request_body.session_id,
+                request_body.query,
+                classifier_output,
+            )
+        )
+
+        # ── Step 7: Done ──────────────────────────────────────────
+        yield format_sse_done()
+
+    # Wrap in pipeline-level timeout.
+    async def timeout_wrapper() -> AsyncGenerator[str, None]:
+        """Enforce total pipeline timeout around generate()."""
+        try:
+            async for event in generate():
+                yield event
         except asyncio.TimeoutError:
-            await logger.aerror(
+            logger.error(
                 "pipeline_timeout",
                 timeout_seconds=settings.pipeline_timeout_seconds,
-                query=request_body.query[:100],
+                session_id=request_body.session_id,
             )
-            yield _sse_event("error", {
-                "error": "timeout",
-                "message": (
-                    f"The request timed out after {settings.pipeline_timeout_seconds} seconds. "
-                    "Please try again."
-                ),
-            })
-
-        except Exception as exc:
-            await logger.aerror(
-                "pipeline_error",
-                error_type=type(exc).__name__,
-                error_msg=str(exc),
+            yield format_sse_error(
+                f"Pipeline timed out after {settings.pipeline_timeout_seconds}s",
+                "PIPELINE_TIMEOUT",
             )
-            yield _sse_event("error", {
-                "error": "internal_error",
-                "message": "An unexpected error occurred. Please try again.",
-            })
+            yield format_sse_done()
 
-    return EventSourceResponse(event_generator())
+    return StreamingResponse(
+        timeout_wrapper(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",  # Disable nginx buffering
+        },
+    )
 
 
-async def _save_turns(
+# ---------------------------------------------------------------------------
+# Session save helper — fire and forget
+# ---------------------------------------------------------------------------
+
+async def _save_session_turn(
     store: SessionStore,
     session_id: str,
-    user_query: str,
-    assistant_response: str,
+    query: str,
+    classifier_output: ClassifierOutput,
 ) -> None:
     """Save user and assistant turns — fire-and-forget task.
 
@@ -251,15 +309,19 @@ async def _save_turns(
     block or crash the response stream.
     """
     try:
-        await store.save_turn(session_id, "user", user_query)
-        await store.save_turn(session_id, "assistant", assistant_response)
-    except Exception as exc:
-        await logger.aerror(
-            "save_turns_failed",
-            session_id=session_id,
-            error_type=type(exc).__name__,
-            error_msg=str(exc),
+        await store.save_turn(session_id, "user", query)
+        summary = (
+            f"[{classifier_output.target_agent.value}] "
+            f"Intent: {classifier_output.intent}"
         )
+        await store.save_turn(session_id, "assistant", summary)
+    except Exception as exc:
+        logger.error(
+            "session_save_error",
+            error=str(exc),
+            session_id=session_id,
+        )
+        # Never raise — session save failure must not affect the response
 
 
 # ---------------------------------------------------------------------------
@@ -268,13 +330,14 @@ async def _save_turns(
 
 @app.get("/health")
 async def health() -> dict:
-    """Simple health check endpoint."""
-    return {"status": "ok", "service": "valura-ai"}
+    """Simple health check endpoint — used by infrastructure for liveness."""
+    settings = get_settings()
+    return {"status": "ok", "environment": settings.environment}
 
 
 @app.get("/")
 async def root() -> dict:
-    """Root endpoint — service info."""
+    """Root endpoint — service info and navigation."""
     return {
         "service": "Valura AI",
         "version": "0.1.0",
