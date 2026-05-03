@@ -30,6 +30,19 @@ from src.models.user import (
     UserProfile,
 )
 
+
+# ---------------------------------------------------------------------------
+# Global test safety
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(autouse=True)
+def no_real_openai_calls(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Prevent any test from accidentally making real OpenAI calls.
+    
+    Tests that need LLM output must use mock_openai_client fixture.
+    """
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
 FIXTURES_DIR = Path(__file__).parent.parent / "fixtures"
 
 
