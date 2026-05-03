@@ -11,7 +11,6 @@ job is to route correctly even when the destination is a stub.
 
 from __future__ import annotations
 
-import json
 from typing import AsyncGenerator
 
 import structlog
@@ -19,6 +18,7 @@ import structlog
 from src.agents.base import BaseAgent
 from src.classifier.schema import AgentType, EntitySet
 from src.models.user import UserProfile
+from src.utils.sse import format_sse_event
 
 logger = structlog.get_logger(__name__)
 
@@ -28,13 +28,10 @@ logger = structlog.get_logger(__name__)
 # ---------------------------------------------------------------------------
 
 class StubAgent(BaseAgent):
-    """Placeholder agent for intents that are not yet implemented.
+    """Structured stub for unimplemented agents.
 
-    Returns a single structured JSON chunk indicating which agent
-    *would* have handled the query, along with the classified intent
-    and extracted entities.  This satisfies the assignment requirement
-    that unimplemented agents return structured "not implemented"
-    responses without crashing or returning errors.
+    Returns an informational not-implemented response as a properly
+    formatted SSE event.  Never crashes.  Never raises.
     """
 
     async def run(
@@ -43,24 +40,24 @@ class StubAgent(BaseAgent):
         entities: EntitySet,
         user_profile: UserProfile,
         session_history: list[dict[str, str]],
+        *,
+        classified_intent: str = "unknown",
+        target_agent: str = "unknown",
     ) -> AsyncGenerator[str, None]:
-        """Yield a single structured "not implemented" response."""
-        # Determine which agent this stub is standing in for.
-        # The target_agent is injected by get_agent() via _agent_type.
-        agent_name = getattr(self, "_agent_type", "unknown")
-
-        response = {
+        """Yield a single structured 'not implemented' SSE event."""
+        payload = {
             "status": "not_implemented",
-            "classified_intent": query,
+            "classified_intent": classified_intent,
             "extracted_entities": entities.model_dump(exclude_none=True),
-            "target_agent": agent_name,
+            "target_agent": target_agent,
             "message": (
-                f"The {agent_name} agent is not available in this build. "
-                f"Your query has been correctly classified and would be "
-                f"handled by this agent in the full system."
+                f"The {target_agent} agent is not available in this build. "
+                f"Your query has been classified and entities extracted. "
+                f"This agent will be implemented in a future version."
             ),
+            "build_version": "v0.1.0",
         }
-        yield json.dumps(response)
+        yield format_sse_event("agent_response", payload)
 
 
 # ---------------------------------------------------------------------------
@@ -91,8 +88,7 @@ def get_agent(agent_type: AgentType) -> BaseAgent:
     """Return an agent instance for the given agent type.
 
     Never raises — unknown or unregistered types fall back to
-    ``StubAgent``.  The returned agent has ``_agent_type`` set so
-    ``StubAgent`` can report which agent it is standing in for.
+    ``StubAgent``.
 
     Parameters
     ----------
@@ -105,16 +101,19 @@ def get_agent(agent_type: AgentType) -> BaseAgent:
         A concrete agent instance ready to call ``.run()``.
     """
     agent_cls = AGENT_REGISTRY.get(agent_type, StubAgent)
-    agent = agent_cls()
 
-    # Tag the agent so StubAgent can report its identity.
-    agent._agent_type = agent_type.value  # type: ignore[attr-defined]
+    if agent_cls is StubAgent and agent_type not in AGENT_REGISTRY:
+        logger.warning(
+            "agent_type_not_in_registry",
+            agent_type=agent_type.value,
+            fallback="StubAgent",
+        )
 
     logger.info(
         "router_dispatch",
         agent_type=agent_type.value,
         agent_class=agent_cls.__name__,
-        is_stub=isinstance(agent, StubAgent),
+        is_stub=issubclass(agent_cls, StubAgent),
     )
 
-    return agent
+    return agent_cls()

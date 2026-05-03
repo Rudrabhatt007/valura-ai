@@ -4,8 +4,9 @@ Every specialist agent (portfolio health, market research, etc.) must
 subclass ``BaseAgent`` and implement the ``run()`` async generator.
 This guarantees a uniform streaming contract across the entire system.
 
-The ``run()`` method yields SSE-formatted strings so the HTTP layer
-can forward them directly to the client without transformation.
+The ``run()`` method yields SSE-formatted strings (via ``format_sse_event``
+from ``src.utils.sse``) so the HTTP layer can forward them directly to
+the client without transformation.
 """
 
 from __future__ import annotations
@@ -27,9 +28,10 @@ class BaseAgent(ABC):
     Example subclass::
 
         class PortfolioHealthAgent(BaseAgent):
-            async def run(self, query, entities, user_profile, session_history):
+            async def run(self, query, entities, user_profile,
+                          session_history, **kwargs):
                 analysis = await self._analyse(user_profile)
-                yield json.dumps(analysis)
+                yield format_sse_event("agent_response", analysis)
     """
 
     @abstractmethod
@@ -39,6 +41,9 @@ class BaseAgent(ABC):
         entities: EntitySet,
         user_profile: UserProfile,
         session_history: list[dict[str, str]],
+        *,
+        classified_intent: str = "unknown",
+        target_agent: str = "unknown",
     ) -> AsyncGenerator[str, None]:
         """Execute the agent and stream response chunks.
 
@@ -53,12 +58,15 @@ class BaseAgent(ABC):
         session_history:
             Prior conversation turns as
             ``[{"role": "user"|"assistant", "content": "..."}]``.
+        classified_intent:
+            The intent label from the classifier (for logging/context).
+        target_agent:
+            The target agent name from the classifier (for logging/context).
 
         Yields
         ------
         str
-            SSE-formatted response chunks.  Each yielded string becomes
-            the ``data:`` field of an ``event: chunk`` SSE frame.
+            SSE-formatted response chunks produced by ``format_sse_event()``.
         """
         # Abstract generator — yield to satisfy the type checker.
         yield ""  # pragma: no cover
